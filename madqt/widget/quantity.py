@@ -10,10 +10,15 @@ from abc import abstractmethod
 import string
 import re
 
+from six import string_types as basestring
+
 from madqt.qt import Qt, QtCore, QtGui
 
-from madqt.core.unit import units, get_raw_label, get_unit, tounit
+from madqt.core.unit import units, get_raw_label, get_unit, tounit, isclose
 from madqt.core.base import Signal
+from madqt.util.symbol import SymbolicValue
+
+from cpymad.util import check_expression
 
 
 Acceptable = QtGui.QValidator.Acceptable
@@ -229,7 +234,6 @@ class DoubleValidator(QtGui.QValidator):
 
     minimum = None
     maximum = None
-    decimals = 4
 
     _ALLOWED_CHARS = set(string.digits + "eE+-.")
     _INTERMEDIATE = re.compile(r'^[+-]?\d*\.?\d*[eE]?[+-]?\d*$')
@@ -239,7 +243,7 @@ class DoubleValidator(QtGui.QValidator):
         if not (set(text) <= self._ALLOWED_CHARS):
             return Invalid, text, pos
         try:
-            value = float(text)
+            value = self.parse(text)
         except ValueError:
             return self._check_invalid(text, pos)
         return self._check_valid(value), text, pos
@@ -260,6 +264,69 @@ class DoubleValidator(QtGui.QValidator):
         if self._INTERMEDIATE.match(text):
             return Intermediate, text, pos
         return Invalid, text, pos
+
+    def parse(self, text):
+        return float(text)
+
+
+class ExpressionValidator(QtGui.QValidator):
+
+    # TODO: allow more general MAD-X expressions like (2*PI)/FOOBAR
+
+    _ALLOWED_CHARS = set(
+        "+-/*^()->." +
+        string.lowercase + string.uppercase +
+        string.digits + string.whitespace)
+
+    def validate(self, text, pos):
+        return self._validate(text), text, pos
+
+    def _validate(self, text):
+        if not self._ALLOWED_CHARS.issuperset(text):
+            return Invalid
+        try:
+            check_expression(text)
+            return Acceptable
+        except ValueError:
+            return Intermediate
+
+    def parse(self, text):
+        return text
+
+
+class QuantityValidator(QtGui.QValidator):
+
+    minimum = None
+    maximum = None
+    allow_expressions = True
+
+    def __init__(self, *args, **kwargs):
+        super(QuantityValidator, self).__init__(*args, **kwargs)
+        self.v_double = DoubleValidator()
+        self.v_expr = ExpressionValidator()
+
+    def validate(self, text, pos):
+        dstate, dtext, dpos = self.v_double.validate(text, pos)
+        if dstate == Acceptable:
+            # NOTE: perform bounds checking in QuantityValidator to intercept
+            # out-of-bound floats getting accepted by ExpressionValidator!
+            return self._check_valid(self.v_double.parse(text)), dtext, dpos
+        if self.allow_expressions:
+            return self.v_expr.validate(text, pos)
+        return Invalid, text, pos
+
+    def _check_valid(self, value):
+        minimum, maximum = self.minimum, self.maximum
+        if minimum is not None and value < minimum:
+            return Intermediate
+        if maximum is not None and value > maximum:
+            return Intermediate
+        return Acceptable
+
+    def parse(self, text):
+        if self.v_double.validate(text, 0) == Acceptable:
+            return self.v_double.parse(text)
+        return self.v_expr.parse(text)
 
 
 class ValueControlBase(AffixControlBase):
@@ -312,9 +379,9 @@ class QuantityControlBase(ValueControlBase):
 
     def __init__(self, parent=None, value=None, unit=None):
         super(QuantityControlBase, self).__init__(parent)
-        self.validator = DoubleValidator()
+        self.validator = QuantityValidator()
         self.unit = unit
-        if isinstance(value, units.Quantity):
+        if isinstance(value, (SymbolicValue, units.Quantity)):
             if self.unit is None:
                 self.set_quantity(value)
             else:
@@ -330,11 +397,14 @@ class QuantityControlBase(ValueControlBase):
         return self.validator.validate(text, pos)
 
     def parse(self, text):
-        return float(text)
+        return self.validator.parse(text)
 
     def format(self, value):
-        num_fmt = '{:' + self.fmtspec + '}'
-        return num_fmt.format(value)
+        if isinstance(value, basestring):
+            return value
+        else:
+            num_fmt = '{:' + self.fmtspec + '}'
+            return num_fmt.format(value)
 
     @property
     def fmtspec(self):
@@ -365,8 +435,12 @@ class QuantityControlBase(ValueControlBase):
         return magnitude * unit
 
     def set_quantity(self, value):
-        self.set_unit(get_unit(value))
-        self.set_magnitude(value.magnitude)
+        if isinstance(value, SymbolicValue):
+            self.set_unit(value._unit)
+            self.set_magnitude(value._expression)
+        else:
+            self.set_unit(get_unit(value))
+            self.set_magnitude(value.magnitude)
 
     magnitude = property(get_magnitude, set_magnitude)
     quantity = property(get_quantity, set_quantity)
@@ -375,8 +449,14 @@ class QuantityControlBase(ValueControlBase):
     # set magnitude/unit/quantity and check units
 
     def set_quantity_checked(self, value):
-        scaled = tounit(value, self.unit)
-        self.set_magnitude(scaled.magnitude)
+        if isinstance(value, SymbolicValue):
+            if not isclose(value._unit, self.unit):
+                # We add use a scaling factor… but to hell with that
+                raise ValueError("Setting expressions with different units is not supported!")
+            self.set_magnitude(value._expression)
+        else:
+            scaled = tounit(value, self.unit)
+            self.set_magnitude(scaled.magnitude)
 
 
 class QuantityDisplay(QuantityControlBase, QtGui.QLineEdit):
